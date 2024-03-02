@@ -1,0 +1,61 @@
+gay-psotnic
+-----------
+
+compilation
+~~~~~~~~~~~
+
+  tar xvzf gay-psotnic-0.1.tar.gz
+
+  cd gay-psotnic-0.1
+
+  ./configure
+
+If you don't want that the bot is installed in HOME/gay-psotnic,
+you should do: ./configure --prefix HOME/somethingelse
+Do not rename the directory later!
+
+  make
+
+If you want to compile modules:
+
+  make modules
+
+
+  make install
+
+ssl support
+~~~~~~~~~~~
+
+  cd easy-rsa
+  . ./vars
+  ./clean-all
+  ./build-ca
+  ./build-key-server server
+
+Please do not copy all lines at once to terminal!
+
+When asked for challenge password hit enter - empty pass.
+When asked whether to sign the certificate answer yes.
+When asked whether to commit certificate answer yes.
+
+Now in easy-rsa/ or easy-rsa/keys/ should be "server.key" and "server.crt".
+You have to copy them to the install directory.
+
+  cp server.key server.crt $HOME/gay-psotnic/
+
+create a conf
+~~~~~~~~~~~~~
+
+change to install directory
+
+  cd $HOME/gay-psotnic
+
+  ./psotnic -n
+
+start bot
+~~~~~~~~~
+
+  ./psotnic conf
+
+  
+Problems? Check AUTHORS for contact information.

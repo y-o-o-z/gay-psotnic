@@ -1,0 +1,881 @@
+/***************************************************************************
+ *   Copyright (C) 2003-2005 by Grzegorz Rusin                             *
+ *   grusin@gmail.com                                                      *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 2 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program; if not, write to the                         *
+ *   Free Software Foundation, Inc.,                                       *
+ *   59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.             *
+ ***************************************************************************/
+
+#include "prots.h"
+#include "global-var.h"
+
+static char arg[11][MAX_LEN], *a, buf[MAX_LEN];
+static chan *ch;
+static chanuser *p;
+static int i;
+
+void parse_irc(char *data)
+{
+	if(!strlen(data))
+		return;
+
+	str2words(arg[0], data, 11, MAX_LEN, 1);
+
+	/* debug */
+#ifdef HAVE_DEBUG
+
+	if(debug)
+	{
+		if(!strcmp(arg[1], "PRIVMSG"))
+		{
+			ch = ME.findChannel(arg[2]);
+
+			if(ch)
+			{
+				if(!strcasecmp(arg[3], "!debug"))
+				{
+					printf("### DEBUG ###\n");
+					printf("CHANNELS: %d\n", ME.channels);
+					ME.display();
+					ch->display();
+					return;
+				}
+			}
+
+			if(!strcmp(arg[3], "!re"))
+			{
+				ME.recheckFlags();
+				return;
+			}
+			
+			/*if(!strcmp(arg[3], "!crash"))
+			{
+				char *buf = NULL;
+				*buf = 9;
+			}*/
+		}
+	}
+#endif
+
+	/* reaction */
+	if(!strcmp(arg[1], "JOIN"))
+	{
+		chanuser u(arg[0], NULL, 0, false);
+		int netjoin = arg[2][0] != ':';
+		if(netjoin)
+			a = arg[2];
+		else
+			a = arg[2] + 1;
+
+		if(!strcasecmp(ME.nick, u.nick))
+		{
+			if(!ME.findNotSyncedChannel(a))
+			{
+				// FIXME: WHO flood if bot receives many JOIN's
+
+				if((i = userlist.findChannel(a)) != -1)
+				{
+					ME.createNewChannel(a);
+					if(!(userlist.chanlist[i].status & WHO_SENT))
+					{
+						net.irc.send("WHO %s", a);
+					}
+				}
+				//if thats !channel maybe we have to change its name
+				//to !0WN3Dchannel
+				//FIXME: is that necessary?
+				else if(*a == '!' && strlen(a) > 6)
+				{
+					buf[0] = '!';
+					strcpy(buf+1, a + 6);
+					if((i = userlist.findChannel(buf)) != -1)
+					{
+						userlist.chanlist[i].name = a;
+						ME.createNewChannel(a);
+						if(!(userlist.chanlist[i].status & WHO_SENT))
+						{
+							net.irc.send("WHO %s", a);
+						}
+					}
+				}
+				else
+				{
+					net.irc.send("PART %s :wtf?", a);
+				}
+			}
+			else
+			{
+				net.send(HAS_N, "\0039 >> Double join to %s <<\003", a);
+			}
+		}
+		else
+		{
+			ch = ME.findChannel(a);
+			if(ch)
+				ch->gotJoin(arg[0], netjoin ? NET_JOINED : 0);
+#ifdef HAVE_DEBUG
+			else if(!ME.findNotSyncedChannel(a))
+				net.send(HAS_N, "\0039 >>> Join observed to non exitsing channel %s <<\003");
+#endif
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "MODE"))
+	{
+		ch = ME.findChannel(arg[2]);
+		if(ch)
+		{
+			char *tmp=srewind(data, 4); // args
+
+                        if(tmp)
+				a=strdup(tmp);
+
+			ch->gotMode(arg[3], tmp ? a : "", arg[0]);
+
+			if(tmp)
+				free(a);
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "KICK"))
+	{
+		if(!strcasecmp(ME.nick, arg[3]))
+		{
+			ch = ME.findChannel(arg[2]);
+			if(ch)
+				ch->buildAllowedOpsList(arg[0]);
+			ME.removeChannel(arg[2]);
+			ME.rejoin(arg[2], set.REJOIN_AFTER_KICK_DELAY);
+		}
+		else
+		{
+			ch = ME.findChannel(arg[2]);
+			if(ch)
+				ch->gotKick(arg[3], arg[0], srewind(data, 4)+1);
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "PART"))
+	{
+		HOOK(pre_part, pre_part(arg[0], arg[2], srewind(data,3), false));
+		stopParsing=false;
+
+		if(!strcasecmp(ME.mask, arg[0]))
+		{
+			ME.removeChannel(arg[2]);
+		}
+		else
+		{
+			ch = ME.findChannel(arg[2]);
+			if(ch)
+			{
+				mem_strncpy(a, arg[0], abs(arg[0] - strchr(arg[0], '!')) + 1);
+				ch->gotPart(a, 0);
+				free(a);
+			}
+
+		}
+		HOOK(post_part, post_part(arg[0], arg[2], srewind(data,3), false));
+		stopParsing=false;
+		return;
+	}
+	if(!strcmp(arg[1], "NICK"))
+	{
+		ME.gotNickChange(arg[0], arg[2]);
+		return;
+	}
+	if(!strcasecmp(arg[1], "352"))
+	{
+		ch = ME.findNotSyncedChannel(arg[3]);
+		if(ch && !ch->synced())
+		{
+
+			wasoptest *w = userlist.chanlist[ch->channum].allowedOps;
+			if(w && w->since + w->TOL <= NOW)
+			{
+				delete userlist.chanlist[ch->channum].allowedOps;
+				userlist.chanlist[ch->channum].allowedOps = NULL;
+			}
+
+			a = push(NULL, arg[7], "!", arg[4], "@", arg[5], NULL);
+			p = ch->gotJoin(a, (strchr(arg[8], '@') ? IS_OP : 0) | (strchr(arg[8], '+') ? IS_VOICE : 0));
+
+			if(!strcasecmp(arg[7], ME.nick))
+				ch->me = p;
+
+			free(a);
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "315"))
+	{
+		ch = ME.findNotSyncedChannel(arg[3]);
+		if(ch)
+		{
+			if(ch->synced())
+				return;
+
+			if(!ch->users.entries())
+			{
+				net.send(HAS_N, "[D] Empty WHO RPL");
+				bk;
+				return;
+			}
+
+			ch->synlevel = 1;
+
+			if(userlist.chanlist[ch->channum].allowedOps)
+			{
+				delete userlist.chanlist[ch->channum].allowedOps;
+				userlist.chanlist[ch->channum].allowedOps = NULL;
+			}
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "324"))
+	{
+		ch = ME.findChannel(arg[3]);
+		if(ch)
+		{
+			//ch->limit = 0;
+			a = arg[4];
+
+			for(i=5; *a && i < 7; ++a)
+			{
+				if(chan::chanModeRequiresArgument('+', *a)) {
+					ch->modes.insert(std::pair<char, string> (*a, arg[i]));
+					i++;
+				}
+
+				else
+					ch->modes.insert(std::pair<char, string> (*a, ""));
+
+                                if(*ch->key() && set.REMEMBER_OLD_KEYS) {
+                                        userlist.chanlist[ch->channum].pass=ch->key();
+                                        userlist.nextSave = NOW + SAVEDELAY;
+				}
+			}
+
+			++ch->synlevel;
+
+			if(ch->limit() == -1) // FIXME: when?
+				ch->nextlimit = -1;
+			else
+				ch->nextlimit = NOW + set.ASK_FOR_OP_DELAY;
+		}
+		else DEBUG(printf("unknown 324 for %s\n", arg[3]));
+		return;
+	}
+	if(!strcmp(arg[1], "QUIT"))
+	{
+		ME.gotUserQuit(arg[0], srewind(data, 2));
+		return;
+	}
+	if(!strcmp(arg[0], "PING"))
+	{
+		net.irc.send("PONG %s", arg[1]);
+		return;
+	}
+	if(!strcmp(arg[1], "PONG"))
+	{
+		struct timeval tv_now;
+
+		if(!strcmp(arg[2], ME.server.name))
+		{
+			gettimeofday(&tv_now, NULL);
+			net.irc.lagcheck.lag = (int) get_timeval_diff(&tv_now, &net.irc.lagcheck.sent);
+			net.irc.lagcheck.inProgress = false;
+			net.irc.lagcheck.next = NOW + set.LAG_CHECK_TIME;
+
+			printf("lag: %f\n", net.irc.lagcheck.lag/1000.0); // TODO: rm
+		}
+	}
+	if(!strcmp(arg[0], "ERROR"))
+	{
+		net.irc.close(data+7);
+		return;
+	}
+	if(!strcmp(arg[1], "433"))
+	{
+		if(net.irc.status & STATUS_REGISTERED)
+			ME.nextNickCheck = NOW + set.KEEP_NICK_CHECK_DELAY;
+		else
+		{
+			if(config.altnick.getLen() && !strcmp(arg[3], config.nick) && strcmp(arg[3], config.altnick))
+				net.irc.send("NICK %s", (const char*) config.altnick);
+			else
+				ME.registerWithNewNick(arg[3]);
+			sleep(1);
+		}
+		return;
+	}
+	if(!strcmp(arg[1], "437"))
+	{
+		if(net.irc.status & STATUS_REGISTERED)
+		{
+			i = userlist.findChannel(arg[3]);
+			if(i == -1)
+			{
+				/* Nick is temp...*/
+				ME.nextNickCheck = NOW + set.KEEP_NICK_CHECK_DELAY;
+			}
+			else
+			{
+				/* Channel is temp... */
+				ME.rejoin(arg[3], set.REJOIN_FAIL_DELAY);
+			}
+		}
+		else
+			ME.registerWithNewNick(arg[3]);
+
+		return;
+	}
+	if(!strcmp(arg[1], "432"))
+	{
+		if(!(net.irc.status & STATUS_REGISTERED))
+		{
+			net.send(HAS_N, "\002Cannot register with nick %s (Erroneous Nickname)\002", arg[3]);
+			strncpy(arg[3], config.nick, MAX_LEN);
+			ME.registerWithNewNick(arg[3]);
+		}
+	}
+
+	if(!strcmp(arg[1], "043"))
+	{
+		/* collision, try to get nick back in 30 mins */
+		ME.nextNickCheck = NOW + 1800;
+		return;
+	}
+
+	if(!strcmp(arg[1], "001") && !(net.irc.status & STATUS_REGISTERED))
+	{
+		mem_strcpy(net.irc.name, arg[0]);
+		ME.server.name=strdup(arg[0]);
+		mem_strcpy(net.irc.origin, arg[0]);
+		net.irc.status |= STATUS_REGISTERED;
+		net.irc.killTime = 0;
+		net.irc.lagcheck.inProgress = false;
+		net.irc.lagcheck.next = NOW + set.LAG_CHECK_TIME;
+
+		if(match("*!*@*", arg[9]))
+		{
+			if(userlist.me()->flags[GLOBAL] & HAS_P)
+				hostNotify = 1;
+			else
+				hostNotify = 0;
+
+			chanuser u(arg[9], NULL, 0, false);
+			ME.nick = u.nick;
+			ME.ident = u.ident;
+			ME.host = u.host;
+			ME.mask = arg[9];
+		}
+		else
+		{
+			/* if it does not tell us the hostmask, we catch only
+			 * the nickname and do WHOIS.
+			 * arg[9] should not be used as nickname because the 001
+			 * lines can be very different - patrick
+			 */
+
+			hostNotify = 0;
+			ME.nick = arg[2];
+			net.irc.status|=STATUS_NEED_WHOIS;
+			net.irc.send("WHOIS %s", (const char*)ME.nick);
+		}
+
+		srand();
+
+		net.propagate(NULL, "%s %s %s", S_CHNICK, (const char *) ME.nick, net.irc.name);
+		if(strcmp(ME.nick, config.nick))
+			ME.nextNickCheck = NOW + set.KEEP_NICK_CHECK_DELAY;
+		else
+			ME.nextNickCheck = 0;
+
+		net.send(HAS_N, "Connected to %s as %s", net.irc.name, (const char *) ME.nick);
+
+		penalty = 2;
+
+		if(!(net.irc.status&STATUS_NEED_WHOIS))
+			ME.checkMyHost("*", true);
+		ME.ircip.assign(net.irc.getPeerIpName(), strlen(net.irc.getPeerIpName()));
+		net.irc.send("stats L %s", (const char *) ME.nick);
+
+		HOOK(connected, connected());
+		stopParsing=false;
+
+		return;
+	}
+	if(!strcmp(arg[1], "211") && strlen(arg[3]))
+	{
+		char *at = strchr(arg[3], '@');
+
+		if(at)
+			ME.ircip.assign(at+1, strlen(at+1)-1);
+		return;
+	}
+	if(!strcmp(arg[1], "004"))
+	{
+		ME.server.version=strdup(arg[4]);
+		ME.server.usermodes=strdup(arg[5]);
+		ME.server.chanmodes=strdup(arg[6]);
+		return;
+	}
+
+	if(!strcmp(arg[1], "005"))
+	{
+		// fill isupport with 005 tokens -- patrick
+
+		char *isupport_str, *key, *value, *p;
+
+		isupport_str=srewind(data, 3);
+
+		if(!isupport_str)
+			return;
+
+		for(key=strtok_r(isupport_str, " ", &p); key; key=strtok_r(NULL, " ", &p))
+		{
+			if(*key == ':')
+				break;
+
+			if((value=strchr(key, '=')))
+			{
+				*value='\0';
+				value++;
+			}
+
+			ME.server.isupport.insert(key, value);
+		}
+
+		ME.server.isupport.init();
+		return;
+	}
+
+	if(!strcmp(arg[1], "042"))
+	{
+		ME.uid = arg[3];
+		return;
+	}
+	if(!strcmp(arg[1], "311") && net.irc.status & STATUS_NEED_WHOIS) // RPL_WHOISUSER
+	{
+		char buffer[MAX_LEN];
+		ME.ident = arg[4];
+		ME.host = arg[5];
+		snprintf(buffer, MAX_LEN, "%s!%s@%s", (const char*)ME.nick, (const char*)ME.ident, (const char*)ME.host);
+		ME.mask = buffer;
+		net.irc.status&= ~STATUS_NEED_WHOIS;
+
+		if(userlist.me()->flags[GLOBAL] & HAS_P)
+			hostNotify = 1;
+		else
+			hostNotify = 0;
+
+		ME.checkMyHost("*", true);
+	}
+	if(!strcmp(arg[1], "332"))
+	{
+		chan *ch = ME.findNotSyncedChannel(arg[3]);
+		if(ch)
+		{
+			ch->topic = srewind(data, 4)+1;
+			HOOK(topicChange, topicChange(ch, ch->topic, NULL, NULL));
+			stopParsing=false;
+		}
+		return;
+	}
+
+	if(!strcmp(arg[1], "TOPIC"))
+	{
+		chan *ch = ME.findChannel(arg[2]);
+		if(ch)
+		{
+#ifdef HAVE_MODULES
+			chanuser *u = ch->getUser(arg[0]);
+#endif
+			pstring<> oldtopic(ch->topic);
+			ch->topic = srewind(data, 3)+1;
+
+			HOOK(topicChange, topicChange(ch, ch->topic, u, oldtopic));
+			stopParsing=false;
+		}
+	}
+
+	if(!strcmp(arg[1], "INVITE"))
+	{
+		chan *ch = NULL;
+		if((i = userlist.findChannel(arg[3])) != -1 && !(ch = ME.findChannel(arg[3])))
+		{
+			if(!(userlist.chanlist[i].status & JOIN_SENT) && userlist.isRjoined(i))
+			{
+				net.irc.send("JOIN %s %s", arg[3], (const char *) userlist.chanlist[i].pass);
+				userlist.chanlist[i].status |= JOIN_SENT;
+			}
+		}
+
+		HOOK(invite, invite(arg[0], arg[3], ch, i == -1 ? NULL : &userlist.chanlist[i]));
+		stopParsing=false;
+		return;
+	}
+
+	if(!strcmp(arg[1], "NOTICE"))
+	{
+		HOOK(notice, notice(arg[0], arg[2], srewind(data, 3) + 1));
+
+		if(stopParsing)
+		{
+			stopParsing=false;
+			return;
+		}
+
+		if(strchr(arg[0], '.') && !strchr(arg[0], '@'))
+		{
+			chan *ch = ME.findChannel(arg[2]);
+
+			if(ch)
+			{
+				if(!strcmp(arg[6], "invitation"))
+				{
+					if(strchr(arg[8], '@'))
+						ME.overrider = arg[8];
+					else
+						ME.overrider = "-";
+
+					return;
+				}
+			}
+		}
+
+		return;
+	}
+
+	if(!strcmp(arg[1], "PRIVMSG"))
+	{
+		/* CTCP */
+		if(arg[3][0] == '\001')
+		{
+			if(data[strlen(data)-1] != '\001')
+				return;
+			data[strlen(data)-1] = '\0';
+			for(i=0; i<3; )
+				if(*data++ == ' ')
+					                    ++i;
+			parse_ctcp(arg[0], data + 2, arg[2]);
+			return;
+		}
+
+		HOOK(privmsg, privmsg(arg[0], arg[2], srewind(data, 3) + 1));
+
+		if(stopParsing)
+		{
+			stopParsing=false;
+			return;
+		}
+
+		if(!strcmp(ME.nick, arg[2]))
+		{
+			/* op pass #chan */
+			if(!strcmp(arg[3], "op") || !strcmp(arg[3], ".op") || !strcmp(arg[3], "!op"))
+			{
+				if(strlen(arg[5]))
+				{
+					ch = ME.findChannel(arg[5]);
+					if(ch)
+					{
+						p = ch->getUser(arg[0]);
+						if(p && p->flags & HAS_O && !(p->flags & IS_OP))
+						{
+							HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+							if(h) ch->modeQ[PRIO_LOW].add(NOW, "+o", p->nick);
+						}
+					}
+				}
+				else
+				{
+					i=0;
+					foreachSyncedChannel(ch)
+					{
+						p = ch->getUser(arg[0]);
+						if(p && p->flags & HAS_O && !(p->flags & IS_OP))
+						{
+							HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+							if(h) ch->modeQ[PRIO_LOW].add(NOW + i, "+o", p->nick);
+							i+=4;
+						}
+					}
+				}
+				return;
+
+			}
+
+			if(!strcmp(arg[3], "voice") || !strcmp(arg[3], ".voice") || !strcmp(arg[3], "!voice"))
+			{
+				if(strlen(arg[5]))
+				{
+					ch = ME.findChannel(arg[5]);
+					if(ch)
+					{
+						p = ch->getUser(arg[0]);
+						if(p && p->flags & (HAS_V | HAS_O) && !(p->flags & IS_VOICE))
+						{
+							HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+							if(h) ch->modeQ[PRIO_LOW].add(NOW, "+v", p->nick);
+						}
+					}
+				}
+				else
+				{
+					i=0;
+					foreachSyncedChannel(ch)
+					{
+						p = ch->getUser(arg[0]);
+						if(p && p->flags & (HAS_V | HAS_O) && !(p->flags & IS_VOICE))
+						{
+							HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+							if(h) ch->modeQ[PRIO_LOW].add(NOW + i, "+v", p->nick);
+							i+=4;
+						}
+					}
+				}
+				return;
+			}
+
+
+
+			/* invite pass #chan */
+			if((!strcmp(arg[3], "invite") || !strcmp(arg[3], ".invite") || !strcmp(arg[3], "!invite")) && strlen(arg[5]))
+			{
+				ch = ME.findChannel(arg[5]);
+				if(ch)
+				{
+					HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+					if(h && (h->flags[MAX_CHANNELS] & HAS_F || h->flags[ch->channum] & HAS_F))
+					{
+						ch->invite(arg[0]);
+					}
+				}
+				return;
+			}
+			/* key pass chan */
+			if((!strcmp(arg[3], "key") || !strcmp(arg[3], ".key") || !strcmp(arg[3], "!key")) && strlen(arg[5]))
+			{
+				ch = ME.findChannel(arg[5]);
+				if(ch && ch->key() && *ch->key())
+				{
+					HANDLE *h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+
+					if(h && (h->flags[MAX_CHANNELS] & HAS_F || h->flags[ch->channum] & HAS_F))
+						ME.notice(arg[0], "%s's key: %s", arg[5], (const char *) ch->key());
+				}
+				return;
+			}
+			/* pass oldpass newpass */
+			if(set.ALLOW_SET_PASS_BY_MSG && (!strcmp(arg[3], "pass") || !strcmp(arg[3], ".pass") || !strcmp(arg[3], "!pass")) && strlen(arg[4]))
+			{
+				HANDLE *h;
+				if(strlen(arg[5])) // pass change
+				{
+					h = userlist.matchPassToHandle(arg[4], arg[0], 0);
+
+					if(h)
+					{
+						if(strlen(arg[5]) < 8)
+						{
+							ME.notice(arg[0], "New password must be at least 8 characters long!");
+						}
+						else
+						{
+							char buf[MAX_LEN];
+
+							if(config.bottype == BOT_MAIN)
+							{
+								userlist.changePass(h->name, arg[5]);
+								net.send(HAS_N, "%s has changed his password",(const char *) h->name);
+								net.send(HAS_B, "%s %s %s", S_PASSWD, h->name, quoteHexStr(h->pass, buf));
+
+								ME.notice(arg[0], "Password changed");
+								userlist.updated();
+							}
+						}
+					}
+					return;
+				}
+				else // pass set
+				{
+					h = userlist.findHandleByHost(arg[0]);
+					if(h && h != userlist.first && (!strcmp((const char*) h->pass, "0000000000000000") || !strlen((const char*) h->pass))) // no pass
+					{
+						if(strlen(arg[4]) < 8)
+						{
+							ME.notice(arg[0], "Password must be at least 8 characters long!");
+						}
+						else
+						{
+							char buf[MAX_LEN];
+
+							if(config.bottype == BOT_MAIN)
+							{
+								userlist.changePass(h->name, arg[4]);
+								net.send(HAS_N, "%s has set his password", (const char *) h->name);
+								net.send(HAS_B, "%s %s %s", S_PASSWD, h->name, quoteHexStr(h->pass, buf));
+
+								ME.notice(arg[0], "Password set");
+								userlist.updated();
+							}
+
+							else
+							{
+								unsigned char hash[16];
+								MD5Hash(hash, arg[4], strlen(arg[4]));
+								quoteHexStr(hash, buf, 16);
+
+								if(net.sendHub("%s %s %s", S_PASSWD, h->name, buf) == 1)
+									ME.notice(arg[0], "Password set");
+								else
+									ME.notice(arg[0], "I am not linked. Try again later.");
+							}
+						}
+					}
+					return;
+				}
+			}
+
+		}
+
+		return;
+	}
+	/* some numeric replies */
+	if((i = atoi(arg[1])))
+	{
+		ch = ME.findChannel(arg[3]);
+		if(ch)
+		{
+			protmodelist::entry *global, *local;
+
+			switch(i)
+			{
+				case RPL_BANLIST:
+					ch->list[BAN].add(arg[4], "", protmodelist::isSticky(arg[4], BAN, ch) ? 0 : set.BIE_MODE_BOUNCE_TIME);
+					return;
+				case RPL_ENDOFBANLIST:
+					++ch->synlevel;
+					ch->list[BAN].received=true;
+					return;
+				case RPL_EXCEPTLIST:
+					local=ch->protlist[EXEMPT]->find(arg[4]);
+					global=userlist.protlist[EXEMPT]->find(arg[4]);
+					ch->list[EXEMPT].add(arg[4], "", ((local && local->sticky) || (global && global->sticky)) ? 0 : set.BIE_MODE_BOUNCE_TIME);
+					if(ch->chset->USER_EXEMPTS==2 && !local && !global)
+						ch->modeQ[PRIO_LOW].add(NOW+penalty+10, "-e", arg[4]);
+					return;
+				case RPL_ENDOFEXCEPTLIST:
+					++ch->synlevel;
+					ch->list[EXEMPT].received=true;
+					return;
+				case RPL_INVITELIST:
+					local=ch->protlist[INVITE]->find(arg[4]);
+					global=userlist.protlist[INVITE]->find(arg[4]);
+					ch->list[INVITE].add(arg[4], "", ((local && local->sticky) || (global && global->sticky)) ? 0 : set.BIE_MODE_BOUNCE_TIME);
+					if(ch->chset->USER_INVITES==2 && !local && !global)
+						ch->modeQ[PRIO_LOW].add(NOW+penalty+10, "-I", arg[4]);
+					return;
+				case RPL_ENDOFINVITELIST:
+					++ch->synlevel;
+					ch->list[INVITE].received=true;
+					return;
+				case RPL_REOPLIST:
+					local=ch->protlist[REOP]->find(arg[4]);
+					global=userlist.protlist[REOP]->find(arg[4]);
+					ch->list[REOP].add(arg[4], "", ((local && local->sticky) || (global && global->sticky)) ? 0 : set.BIE_MODE_BOUNCE_TIME);
+					if(ch->chset->USER_REOPS==2 && !local && !global)
+						ch->modeQ[PRIO_LOW].add(NOW+penalty+10, "-R", arg[4]);
+					return;
+				case RPL_ENDOFREOPLIST:
+					++ch->synlevel;
+					ch->list[REOP].received=true;
+					return;
+				//case ERR_NOSUCHNICK:
+				//	return;
+				//case ERR_NOSUCHCHANNEL:
+				//	return;
+				default:
+					break;
+			}
+		}
+		//not on channel
+		else
+		{
+			//if arg[3] is channel name, set rejoin delay
+			if(userlist.findChannel(arg[3]) != -1)
+				ME.rejoin(arg[3], set.REJOIN_FAIL_DELAY);
+			//else if(chan::valid(arg[3]))
+			//	net.send(HAS_N, "[!] >> Strange server response: %s <<", data);
+
+			srand();
+
+			switch(i)
+			{
+				//+i: S_INVITE <seed> <channel>
+				case ERR_INVITEONLYCHAN:
+				{
+					if(userlist.findChannel(arg[3]) != -1 && !ME.waitForMyHost)
+						net.propagate(NULL, "%s %s %s", S_INVITE, itoa(rand() % 2048), arg[3]);
+					return;
+				}
+				//+b: S_UNBANME <seed> <nick!ident@host> <channel> [ip] [uid]
+				case ERR_BANNEDFROMCHAN:
+				{
+					if(userlist.findChannel(arg[3]) != -1 && !ME.waitForMyHost)
+						net.propagate(NULL, "%s %s %s %s %s %s", S_UNBANME, itoa(rand() % 2048), (const char *) ME.mask,
+									  arg[3],  (const char *) ME.ircip, (const char *) ME.uid);
+						return;
+				}
+				//+l: S_BIDLIMIT <seed> <channel>
+				case ERR_CHANNELISFULL:
+				{
+					if(userlist.findChannel(arg[3]) != -1 && !ME.waitForMyHost)
+						net.propagate(NULL, "%s %s %s", S_BIDLIMIT, itoa(rand() % 2048), arg[3]);
+					return;
+				}
+				//+k: S_KEY <seed> <channel>
+				case ERR_BADCHANNELKEY:
+				{
+					if(userlist.findChannel(arg[3]) != -1 && !ME.waitForMyHost)
+						net.propagate(NULL, "%s %s %s", S_KEY, itoa(rand() % 2048), arg[3]);
+					return;
+				}
+				//k:lined
+				case ERR_YOUREBANNEDCREEP:
+				{
+					net.irc.status |= STATUS_KLINED;
+					mem_strcpy(net.irc.name, arg[0]);
+					a = srewind(data, 3);
+					net.send(HAS_N, "[-] I am K-lined on %s (%s)", net.irc.name, a+1);
+					a = srewind(data, 10);
+
+					if(a)
+						net.irc.close(a);
+					else
+						net.irc.close("K-lined");
+					return;
+				}
+				default:
+				break;
+			}
+		}
+	}
+
+	HOOK(crap, crap(data));
+	stopParsing=false;
+}

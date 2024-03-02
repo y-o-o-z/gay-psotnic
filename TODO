@@ -1,0 +1,17 @@
+0.1
+---
+- fix segfault when opping bots after they observed lots of mode changes (?)
+ 
+0.2
+---
+- remove --with-ssl, there's an autocheck already
+- remove .chaddr
+- remove make debug
+  - add ./configure --(with-)debug
+- new botnetmodel - main/slave/leaf is awful
+  - trees like that should be possible:
+     A
+     |-B
+       |-C
+         |-D
+        
